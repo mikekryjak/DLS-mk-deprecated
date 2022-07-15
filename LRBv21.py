@@ -12,14 +12,13 @@ from timeit import default_timer as timer
 import pandas as pd
 import sys
 
-# import ThermalFrontFormulation as TF
 
 """
 This version is for implementing density and power as a detachment front driver
 """
 
 #Function to integrate, that returns dq/ds and dt/ds using Lengyel formulation and field line conduction
-def LengFunc(y,s,kappa0,nu,Tu,cz,qpllu0,alpha,radios,S,B,Xpoint,Lfunc,qradial, qradial_fix):
+def LengFunc(y,s,kappa0,nu,Tu,cz,qpllu0,alpha,radios,S,B,Xpoint,Lfunc,qradial):
 
     qoverB,T = y
     #set density using constant pressure assumption
@@ -41,11 +40,10 @@ def LengFunc(y,s,kappa0,nu,Tu,cz,qpllu0,alpha,radios,S,B,Xpoint,Lfunc,qradial, q
     if radios["upstreamGrid"]:
         if s >S[Xpoint]:
             # The second term here converts the x point qpar to a radial heat source acting between midplane and the xpoint
-            if qradial_fix == True:
-                try:
-                    dqoverBds = ((nu**2*Tu**2)/T**2)*cz*Lfunc(T) - qradial * fieldValue / B(S[Xpoint]) # account for flux expansion to Xpoint
-                except:
-                    print("Failed. s: {:.2f}".format(s))
+            try:
+                dqoverBds = ((nu**2*Tu**2)/T**2)*cz*Lfunc(T) - qradial * fieldValue / B(S[Xpoint]) # account for flux expansion to Xpoint
+            except:
+                print("Failed. s: {:.2f}".format(s))
             else:
                 dqoverBds = ((nu**2*Tu**2)/T**2)*cz*Lfunc(T) - qradial  
         else:
@@ -66,30 +64,28 @@ def LengFunc(y,s,kappa0,nu,Tu,cz,qpllu0,alpha,radios,S,B,Xpoint,Lfunc,qradial, q
     return [dqoverBds,dtds]
 
 
-def LRBv21(constants,radios,S,Spol,indexRange, 
+def LRBv21(constants,radios,d,SparRange, 
                              control_variable = "impurity_frac",
-                             qradial_fix = True,
-                             qradial_fix2 = False,
                              dynamic_grid = False,
                              dynamic_grid_res = 1000,
                              verbosity = 0, Ctol = 1e-3, Ttol = 1e-2, 
-                             acceleration = 0, URF = 0.9,
+                             acceleration = 0, URF = 1,
                              timeout = 20):
     """ function that returns the impurity fraction required for a given temperature at the target. Can request a low temperature at a given position to mimick a detachment front at that position.
     constants: dict of options
     radios: dict of options
-    S: S parallel array
     indexRange: array of S indices of the parallel front locations to solve for
     control_variable: either impurity_frac, density or power
-    qradial_fix: accounts for flux expansion in the heating region (midplane to Xpoint)
     dynamic_grid: WIP - DOESNT WORK - refines grid between front location and Xpoint to uniformly spaced in Spar as per dynamic_grid_res
     Ctol: error tolerance target for the inner loop (i.e. density/impurity/heat flux)
     Ttol: error tolerance target for the outer loop (i.e. rerrunning until Tu convergence)
-    acceleration: makes bisection method faster for the inner loop by pre-centering bounds
-    URF: under-relaxation factor for temperature. If URF is 0.2, Tu_new = Tu_old*0.8 + Tu_calculated*0.2
-    Timeout: controls timeout for all three loops within the code. Each has different message on timeout
+    acceleration: makes bisection method faster for the inner loop by pre-centering bounds. Do not use. No benefit and makes it unstable.
+    URF: under-relaxation factor for temperature. If URF is 0.2, Tu_new = Tu_old*0.8 + Tu_calculated*0.2. Always set to 1.
+    Timeout: controls timeout for all three loops within the code. Each has different message on timeout. Default 20
     
     """
+    
+    # Initialise variables
     t0 = timer()
     C = []
     radfraction = []
@@ -98,22 +94,29 @@ def LRBv21(constants,radios,S,Spol,indexRange,
     error0 = 1
     output = defaultdict(list)
 
-    #lay out constants
+    # Lay out constants
     gamma_sheath = constants["gamma_sheath"]
     qpllu0 = constants["qpllu0"]
     nu0 = constants["nu0"]
     cz0 = constants["cz0"]
-    kappa0 = constants["kappa0"]
-    mi = constants["mi"]
-    echarge = constants["echarge"]
     Tt = constants["Tt"]
-    Xpoint = constants["XpointIndex"]
-    B = constants["B"]
     Lfunc = constants["Lfunc"]
     alpha = constants["alpha"]
     
+    # Physics constants
+    kappa0 = 2500 # Electron conductivity
+    mi = 3*10**(-27) # Ion mass
+    echarge = 1.60*10**(-19) # Electron charge
+    
+    # Extract topology data
+    Xpoint = d["Xpoint"]
+    S = d["S"]
+    Spol = d["Spol"]
+    Btot = d["Btot"]
+    B = interpolate.interp1d(S, Btot, kind = "cubic")
+    indexRange = [np.argmin(abs(d["S"] - x)) for x in SparRange] # Indices of topology arrays to solve code at
 
-    #initialise arrays for storing cooling curve data
+    # Initialise arrays for storing cooling curve data
     Tcool = np.linspace(0.3,500,1000)#should be this for Ar? Ryoko 20201209 --> almost no effect
     Lalpha = []
     for dT in Tcool:
@@ -124,32 +127,26 @@ def LRBv21(constants,radios,S,Spol,indexRange,
     Lz = [Tcool,Lalpha]
     
     # Calculation of radial heat transfer needed to achieve correct qpllu0 at Xpoint
-    if qradial_fix2 == True:
-        Btot = [B(x) for x in S]
-        qradial = qpllu0/ np.trapz(Btot[Xpoint:] / Btot[Xpoint], x = S[Xpoint:])
-        print("qradial: {:.3E}".format(qradial))
-    else:
-        qradial = qpllu0/np.abs(S[-1]-S[Xpoint])
+    qradial = qpllu0/np.abs(S[-1]-S[Xpoint])
 
     print("Solving...", end = "")
     
+    """------ITERATOR FUNCTION------"""
     # Define iterator function. This just solves the Lengyel function and unpacks the results.
+    # It must be defined here and not outside of the main function because it depends on many global
+    # variables.
+    
     def iterate(cvar, Tu):
         if control_variable == "impurity_frac":
             cz = cvar
             nu = nu0
-            # qradial = qpllu0/np.abs(S[-1]-S[Xpoint]) # Change Q radial so it takes B field into account
 
         elif control_variable == "density":
             cz = cz0
             nu = cvar
-            # qradial = qpllu0/np.abs(S[-1]-S[Xpoint])   
-            
-        if qradial_fix2 == True:
-            Btot = [B(x) for x in S]
-            qradial = qpllu0/ np.trapz(Btot[Xpoint:] / Btot[Xpoint], x = S[Xpoint:])
-        else:
-            qradial = qpllu0/np.abs(S[-1]-S[Xpoint])
+   
+        Btot = [B(x) for x in S]
+        qradial = qpllu0/ np.trapz(Btot[Xpoint:] / Btot[Xpoint], x = S[Xpoint:])
             
         if control_variable == "power":
             cz = cz0
@@ -159,7 +156,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
         if verbosity>2:
             print(f"qpllu0: {qpllu0:.3E} | nu: {nu:.3E} | Tu: {Tu:.1f} | cz: {cz:.3E} | cvar: {cvar:.2E}", end = "")
 
-        result = odeint(LengFunc,y0=[qpllt/B(s[0]),Tt],t=s,args=(kappa0,nu,Tu,cz,qpllu0,alpha,radios,S,B,Xpoint,Lfunc,qradial,qradial_fix))
+        result = odeint(LengFunc,y0=[qpllt/B(s[0]),Tt],t=s,args=(kappa0,nu,Tu,cz,qpllu0,alpha,radios,S,B,Xpoint,Lfunc,qradial))
         out = dict()
         # Result returns integrals of [dqoverBds, dtds]
         out["q"] = result[:,0]*B(s)
@@ -187,9 +184,11 @@ def LRBv21(constants,radios,S,Spol,indexRange,
             print(f" -> qpllu1: {qpllu1:.3E} | Tucalc: {Tucalc:.1f} | error1: {out['error1']:.3E}")
 
         return out
+    
+    """------SOLVE------"""
 
-    for point in indexRange:
-        if dynamic_grid == True:
+    for point in indexRange: # For each detachment front location:
+        if dynamic_grid == True: # WIP DO NOT USE.
         # Rescale grid for arbitrary resolution between front and Xpoint
             S, Spol, Xpoint = make_dynamic_grid(S, Spol, Xpoint, dynamic_grid_res, point)
             
@@ -198,7 +197,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
         if verbosity > 0:
             print("\n---SOLVING FOR INDEX {}".format(point))
             
-        """------INITIAL GUESSES"""
+        """------INITIAL GUESSES------"""
         
         # Current set of parallel position coordinates
         s = S[point:]
@@ -247,7 +246,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
         qpllt = gamma_sheath/2*nu0*Tu*echarge*np.sqrt(2*Tt*echarge/mi)
         
         
-        """------INITIALISATION"""
+        """------INITIALISATION------"""
         
         log = defaultdict(list)
         error1 = 1 # Inner loop error (error in qpllu based on provided cz/ne)
@@ -263,7 +262,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
             if verbosity > 1:
                 print("\ncvar: {:.3E}, error1: {:.3E}".format(cvar, out["error1"]))
 
-            """------INITIAL SOLUTION BOUNDING"""
+            """------INITIAL SOLUTION BOUNDING------"""
 
             # We are either doubling or halving cvar until the error flips sign
             # Reverse search is a WIP: activate if you find a case where the guess vs. error relationship is negative
@@ -301,8 +300,8 @@ def LRBv21(constants,radios,S,Spol,indexRange,
                     break
                     
                 if k1 == timeout - 1:
-                    print("******INITIAL BOUNDING TIMEOUT! Saturation!. Set verbosity = 3!*******")
-                    print(f"qpllu0: {qpllu0} | qpllu1: {qpllu1}")
+                    print("******INITIAL BOUNDING TIMEOUT! Failed. Set verbosity = 3 if you want to diagnose.*******")
+                    # print(f"qpllu0: {out['qpllu0']} | qpllu1: {out['qpllu1']}")
                     # cvar = log["cvar"][0]
                     # reverse_search = True
                     # sys.exit()
@@ -322,6 +321,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
             # The solution often ends up very near one bound, meaning the other is far away
             # We can pre-narrow this band by x halvings where x = acceleration
             # This can make the bound miss the solution and timeout.
+            # ***This is no longer recommended to use***
             if acceleration > 0: 
 
                 if verbosity > 1:
@@ -339,7 +339,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
                     print("-->After centering: {:.3E}-{:.3E}".format(lower_bound, upper_bound))
 
 
-            """------INNER LOOP"""
+            """------INNER LOOP------"""
 
             for k2 in range(timeout):
 
@@ -367,7 +367,7 @@ def LRBv21(constants,radios,S,Spol,indexRange,
                     print("******INNER LOOP TIMEOUT! Reduce acceleration factor or loosen Ctol. Set verbosity = 2!*******")
                     #sys.exit()
                     
-            # Calculate the new Tu by mixing half the old and half the new value.
+            # Calculate the new Tu by mixing new value with old one by factor URF (Under-relaxation factor)
             Tucalc = out["Tu"]
             Tu = (1-URF)*Tu + URF*Tucalc
             error0 = (Tu-Tucalc)/Tu
@@ -395,7 +395,9 @@ def LRBv21(constants,radios,S,Spol,indexRange,
                 print("******OUTER TIMEOUT! Loosen Ttol or reduce under-relaxation factor. Set verbosity = 2!*******")
                 #sys.exit()
 
-                
+            
+        """------COLLECT PROFILE DATA------"""
+        
         if control_variable == "power":
             output["cvar"].append(1/cvar) # so that output is in Wm-2
         else:
@@ -417,11 +419,19 @@ def LRBv21(constants,radios,S,Spol,indexRange,
         output["Rprofiles"].append(Qrad)
         output["logs"].append(log)
         
-    # Relative C variable
+    """------COLLECT RESULTS------"""
+    # Here we calculate things like window, threshold etc from a whole scan.
+    
+    # Relative control variable:
     cvar_list = np.array(output["cvar"])
     crel_list = cvar_list / cvar_list[0]
+    
+    # S parallel and poloidal locations of each front location (for plotting against cvar/crel):
     splot = output["Splot"]
     spolplot = output["SpolPlot"]
+    
+    # Below code finds the first stable detachment solution - useful if dealing with inner divertor leg
+    # which may have an unstable region. It returns cvar and crel trim which exclude unstable values for plotting purposes.
     
     # Trim negative gradient
     crel_list_trim = crel_list.copy()
@@ -447,7 +457,8 @@ def LRBv21(constants,radios,S,Spol,indexRange,
             if i > 0 and np.sign(grad[i]) != np.sign(grad[i-1]):
                 crel_list_trim[:i] = np.nan
                 cvar_list_trim[:i] = np.nan
-            
+                
+    # Pack things into the output dictionary.
     output["splot"] = splot
     output["indexRange"] = indexRange    
     output["cvar"] = cvar_list
